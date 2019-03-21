@@ -1,18 +1,27 @@
-#!/usr/bin/env python
-from __future__ import (absolute_import, division, print_function, unicode_literals)
-
-import argparse
+import click
 import datetime as dt
+from itertools import chain
 import logging
+from math import ceil
 import os
-import re
 import sys
-import time
-from collections import OrderedDict
 import configparser
-import requests
-from bs4 import BeautifulSoup
 
+import requests
+from requests.exceptions import ConnectionError
+from slugify import slugify
+
+from api import (
+    PacktAPIClient,
+    PACKT_API_PRODUCTS_URL,
+    PACKT_PRODUCT_SUMMARY_URL,
+    PACKT_API_PRODUCT_FILE_TYPES_URL,
+    PACKT_API_PRODUCT_FILE_DOWNLOAD_URL,
+    PACKT_API_FREE_LEARNING_OFFERS_URL,
+    PACKT_API_USER_URL,
+    PACKT_API_FREE_LEARNING_CLAIM_URL,
+    DEFAULT_PAGINATION_SIZE
+)
 from utils.anticaptcha import Anticaptcha
 from utils.logger import get_logger
 
@@ -26,6 +35,19 @@ SUCCESS_EMAIL_BODY = "A new free Packt ebook \"{}\" was successfully grabbed. En
 FAILURE_EMAIL_SUBJECT = "{} Grabbing a new free Packt ebook failed"
 FAILURE_EMAIL_BODY = "Today's free Packt ebook grabbing has failed with exception: {}!\n\nCheck this out!"
 
+PACKT_FREE_LEARNING_URL = 'https://www.packtpub.com/packt/offers/free-learning/'
+PACKT_RECAPTCHA_SITE_KEY = '6LeAHSgUAAAAAKsn5jo6RUSTLVxGNYyuvUcLMe0_'
+
+
+def slugify_book_title(title):
+    """Return book title with spaces replaced by underscore and unicodes replaced by characters valid in filenames."""
+    return slugify(title, separator='_', lowercase=False)
+
+
+class PacktConnectionError(ConnectionError):
+    """Error raised whenever fetching data from Packt page fails."""
+    pass
+
 
 class ConfigurationModel(object):
     """Contains all needed urls, passwords and packtpub account data stored in .cfg file"""
@@ -36,25 +58,13 @@ class ConfigurationModel(object):
         self.configuration = configparser.ConfigParser()
         if not self.configuration.read(self.cfg_file_path):
             raise configparser.Error('{} file not found'.format(self.cfg_file_path))
-        self.book_infodata_log_file = self._get_config_ebook_extrainfo_log_filename()
         self.anticaptcha_clientkey = self.configuration.get("ANTICAPTCHA_DATA", 'key')
-        self.packtpub_url = "https://www.packtpub.com"
-        self.my_books_url = "https://www.packtpub.com/account/my-ebooks"
-        self.login_url = "https://www.packtpub.com/register"
-        self.freelearning_url = "https://www.packtpub.com/packt/offers/free-learning"
-        self.req_headers = {'Connection': 'keep-alive',
-                            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; WOW64) AppleWebKit/537.36 '
-                                          '(KHTML, like Gecko) Chrome/51.0.2704.103 Safari/537.36'}
         self.my_packt_email, self.my_packt_password = self._get_config_login_data()
-        self.download_folder_path, self.download_formats, self.download_book_titles = self._get_config_download_data()
+        self.download_folder_path, self.download_formats = self._get_config_download_data()
         if not os.path.exists(self.download_folder_path):
             message = "Download folder path: '{}' doesn't exist".format(self.download_folder_path)
             logger.error(message)
             raise ValueError(message)
-
-    def _get_config_ebook_extrainfo_log_filename(self):
-        """Gets the filename of the ebook metadata log file."""
-        return self.configuration.get("DOWNLOAD_DATA", 'ebook_extra_info_log_file_path')
 
     def _get_config_login_data(self):
         """Gets user login credentials."""
@@ -67,226 +77,138 @@ class ConfigurationModel(object):
         download_path = self.configuration.get("DOWNLOAD_DATA", 'download_folder_path')
         download_formats = tuple(form.replace(' ', '') for form in
                                  self.configuration.get("DOWNLOAD_DATA", 'download_formats').split(','))
-        download_book_titles = None
-        try:
-            download_book_titles = [title.strip(' ') for title in
-                                    self.configuration.get("DOWNLOAD_DATA", 'download_book_titles').split(',')]
-            if len(download_book_titles) is 0:
-                download_book_titles = None
-        except configparser.Error:
-            pass
-        return download_path, download_formats, download_book_titles
-
-    @staticmethod
-    def convert_book_title_to_valid_string(title):
-        """removes all unicodes and chars only valid in pathnames on Linux/Windows OS"""
-        if title is not None:
-            return re.sub(r'(?u)[^-\w.#]', '', title.strip().replace(' ', '_'))  # format valid pathname
-        return None
+        return download_path, download_formats
 
 
 class PacktPublishingFreeEbook(object):
     """Contains some methods to claim, download or send a free daily ebook"""
 
-    download_formats = ('pdf', 'mobi', 'epub', 'code')
-    session = None
+    download_formats = ('pdf', 'mobi', 'epub', 'video', 'code')
 
     def __init__(self, cfg):
         self.cfg = cfg
-        self.book_title = ""
+        self.book_data = None
 
-    def login_required(func, *args, **kwargs):
-        def login_decorated(self, *args, **kwargs):
-            if self.session is None:
-                self.__create_http_session()
-            return func(self, *args, **kwargs)
-        return login_decorated
+    def get_all_books_data(self, api_client):
+        """Fetch all user's ebooks data."""
+        logger.info("Getting your books data...")
+        try:
+            response = api_client.get(PACKT_API_PRODUCTS_URL)
+            pages_total = int(ceil(response.json().get('count') / DEFAULT_PAGINATION_SIZE))
+            my_books_data = list(chain(*map(
+                lambda page: self.get_single_page_books_data(api_client, page),
+                range(pages_total)
+            )))
+            logger.info('Books data has been successfully fetched.')
+            return my_books_data
+        except (AttributeError, TypeError):
+            logger.error('Couldn\'t fetch user\'s books data.')
 
-    def __create_http_session(self):
-        """Creates the http session"""
-        form_data = {'email': self.cfg.my_packt_email,
-                     'password': self.cfg.my_packt_password,
-                     'op': 'Login',
-                     'form_build_id': '',
-                     'form_id': 'packt_user_login_form'}
-        # to get form_build_id
-        logger.info("Creating session...")
-        self.session = requests.Session()
-        self.session.headers.update(self.cfg.req_headers)
-        r = self.session.get(self.cfg.login_url, timeout=10)
-        content = BeautifulSoup(str(r.content), 'html.parser')
-        form_build_id = [element['value'] for element in
-                         content.find(id='packt-user-login-form').find_all('input', {'name': 'form_build_id'})]
-        form_data['form_build_id'] = form_build_id[0]
-        self.session.post(self.cfg.login_url, data=form_data)
-        # check once again if we are really logged into the server
-        r = self.session.get(self.cfg.my_books_url, timeout=10)
-        if r.status_code is not 200 or r.text.find("register-page-form") != -1:
-            message = "Login failed!"
-            logger.error(message)
-            raise requests.exceptions.RequestException(message)
-        logger.info("Session created, logged in successfully!")
+    def get_single_page_books_data(self, api_client, page):
+        """Fetch ebooks data from single products API pagination page."""
+        try:
+            response = api_client.get(
+                PACKT_API_PRODUCTS_URL,
+                params={
+                    'sort': 'createdAt:DESC',
+                    'offset': DEFAULT_PAGINATION_SIZE * page,
+                    'limit': DEFAULT_PAGINATION_SIZE
+                }
+            )
+            return [{'id': t['productId'], 'title': t['productName']} for t in response.json().get('data')]
+        except Exception:
+            logger.error('Couldn\'t fetch page {} of user\'s books data.'.format(page))
 
-    def __claim_ebook_captchaless(self, url, html):
-        claim_url = html.find(attrs={'class': 'twelve-days-claim'})['href']
-        return self.session.get(self.cfg.packtpub_url + claim_url, timeout=10)
-
-    def __claim_ebook_captchafull(self, url, html):
-        key_pattern = re.compile("Packt.offers.onLoadRecaptcha\(\'(.+?)\'\)")
-        website_key = key_pattern.search(html.find(text=key_pattern)).group(1)
+    def solve_packt_recapcha(self):
+        """Solve Packt Free Learning website site ReCAPTCHA."""
+        logger.info('Started solving ReCAPTCHA on Packt Free Learning website...')
         anticaptcha = Anticaptcha(self.cfg.anticaptcha_clientkey)
-        captcha_solved_id = anticaptcha.solve_recaptcha(url, website_key)
-        claim_url = html.select_one('.free-ebook form')['action']
-        return self.session.post(self.cfg.packtpub_url + claim_url,
-                                 timeout=10,
-                                 data={'g-recaptcha-response': captcha_solved_id})
+        return anticaptcha.solve_recaptcha(PACKT_FREE_LEARNING_URL, PACKT_RECAPTCHA_SITE_KEY)
 
-    def __write_ebook_infodata(self, data):
-        """
-        Write result to file
-        :param data: the data to be written down
-        """
-        info_book_path = os.path.join(self.cfg.cfg_folder_path, self.cfg.book_infodata_log_file)
-        with open(info_book_path, "a") as output:
-            output.write('\n')
-            for key, value in data.items():
-                output.write('{} --> {}\n'.format(key.upper(), value))
-        logger.info("Complete information for '{}' have been saved".format(data["title"]))
+    def grab_ebook(self, api_client):
+        """Grab Packt Free Learning ebook."""
+        logger.info("Start grabbing ebook...")
 
-    def __get_ebook_infodata(self, r):
-        """
-        Log grabbed book information to log file
-        :param r: the previous response got when book has been successfully added to user library
-        :return: the data ready to be written to the log file
-        """
-        logger.info("Retrieving complete information for '{}'".format(self.book_title))
-        r = self.session.get(self.cfg.freelearning_url, timeout=10)
-        result_html = BeautifulSoup(r.text, 'html.parser')
-        last_grabbed_book = result_html.find('div', {'class': 'dotd-main-book-image'})
-        book_url = last_grabbed_book.find('a').attrs['href']
-        book_page = self.session.get(self.cfg.packtpub_url + book_url, timeout=10).text
-        page = BeautifulSoup(book_page, 'html.parser')
+        utc_today = dt.datetime.utcnow().replace(hour=0, minute=0, second=0, microsecond=0)
+        offer_response = api_client.get(
+            PACKT_API_FREE_LEARNING_OFFERS_URL,
+            params={
+                'dateFrom': utc_today.isoformat(),
+                'dateTo': (utc_today + dt.timedelta(days=1)).isoformat()
+            }
+        )
+        [offer_data] = offer_response.json().get('data')
+        offer_id = offer_data.get('id')
+        product_id = offer_data.get('productId')
 
-        result_data = OrderedDict()
-        result_data["title"] = self.book_title
-        result_data["description"] = page.find('div', {'class': 'book-top-block-info-one-liner'}).text.strip()
-        author = page.find('div', {'class': 'book-top-block-info-authors'})
-        result_data["author"] = author.text.strip().split("\n")[0]
-        result_data["date_published"] = page.find('time').text
-        code_download_url = page.find('div', {'class': 'book-top-block-code'}).find('a').attrs['href']
-        result_data["code_files_url"] = self.cfg.packtpub_url + code_download_url
-        result_data["downloaded_at"] = time.strftime("%d-%m-%Y %H:%M")
-        logger.success("Info data retrieved for '{}'".format(self.book_title))
-        self.__write_ebook_infodata(result_data)
-        return result_data
+        user_response = api_client.get(PACKT_API_USER_URL)
+        [user_data] = user_response.json().get('data')
+        user_id = user_data.get('id')
 
-    def __get_my_all_books_data(self):
-        """Gets data from all available ebooks"""
-        logger.info("Getting data of all your books...")
-        r = self.session.get(self.cfg.my_books_url, timeout=10)
-        if r.status_code is not 200:
-            message = "Cannot open {}, http GET status code != 200".format(self.cfg.my_books_url)
-            logger.error(message)
-            raise requests.exceptions.RequestException(message)
-        logger.info("Opened '{}' successfully!".format(self.cfg.my_books_url))
+        claim_response = api_client.put(
+            PACKT_API_FREE_LEARNING_CLAIM_URL.format(user_id=user_id, offer_id=offer_id),
+            json={'recaptcha': self.solve_packt_recapcha()}
+        )
 
-        self.book_data = []
-        my_books_html = BeautifulSoup(r.text, 'html.parser')
-        all = my_books_html.find_all('div', {'class': 'product-line'})
-        for line in all:
-            if not line.get('nid'):
-                continue
-            title = line.find('div', {'class': 'title'}).getText().strip(' ').replace(' [eBook]', '')
-            download_urls = {}
-            for a in line.find_all('a'):
-                url = a.get('href')
-                for fm in self.download_formats:
-                    if url.find(fm) != -1:
-                        download_urls[fm] = url
-            self.book_data.append({'title': title, 'download_urls': download_urls})
+        product_response = api_client.get(PACKT_PRODUCT_SUMMARY_URL.format(product_id=product_id))
+        self.book_data = {'id': product_id, 'title': product_response.json()['title']}\
+            if product_response.status_code == 200 else None
 
-    @login_required
-    def grab_ebook(self, log_ebook_infodata=False):
-        """Grabs the ebook"""
-        logger.info("Start grabbing eBook...")
-        url = self.cfg.freelearning_url
-        r = self.session.get(self.cfg.freelearning_url, timeout=10)
-        if r.status_code is not 200:
-            raise requests.exceptions.RequestException("http GET status code != 200")
-        html = BeautifulSoup(r.text, 'html.parser')
-        if 'href' not in html.find(attrs={'class': 'twelve-days-claim'}):
-            logger.info("Captcha detected. Trying to solve it using anti-captcha.com.")
-            r = self.__claim_ebook_captchafull(url, html)
+        if claim_response.status_code == 200:
+            logger.info('A new Packt Free Learning ebook "{}" has been grabbed!'.format(self.book_data['title']))
+        elif claim_response.status_code == 409:
+            logger.info('You have already claimed Packt Free Learning "{}" offer.'.format(self.book_data['title']))
         else:
-            logger.info("No captcha detected.")
-            r = self.__claim_ebook_captchaless(url, html)
-        self.book_title = ConfigurationModel.convert_book_title_to_valid_string(
-            html.find('div', {'class': 'dotd-title'}).find('h2').next_element)
-        if r.status_code is 200 and r.text.find('My eBooks') != -1:
-            logger.success("eBook: '{}' has been successfully grabbed!".format(self.book_title))
-            if log_ebook_infodata:
-                self.__get_ebook_infodata(r)
-        else:
-            message = "eBook: {} has not been grabbed!, does this promo exist yet? visit the page and check!".format(
-                self.book_title)
-            logger.error(message)
-            raise requests.exceptions.RequestException(message)
+            logger.error('Claiming Packt Free Learning book has failed.')
 
-    @login_required
-    def download_books(self, titles=None, formats=None, into_folder=False):
-        """
-        Downloads the ebooks.
-        :param titles: list('C# tutorial', 'c++ Tutorial') ;
-        :param formats: tuple('pdf','mobi','epub','code');
-        """
+    def download_books(self, api_client, product_data=None, formats=None, into_folder=False):
+        """Download selected products."""
+        def get_product_download_urls(product_id):
+            error_message = 'Couldn\'t fetch download URLs for product {}.'.format(product_id)
+            try:
+                response = api_client.get(PACKT_API_PRODUCT_FILE_TYPES_URL.format(product_id=product_id))
+                if response.status_code == 200:
+                    return {
+                        format: PACKT_API_PRODUCT_FILE_DOWNLOAD_URL.format(product_id=product_id, file_type=format)
+                        for format in response.json().get('data')[0].get('fileTypes')
+                    }
+                else:
+                    logger.info(error_message)
+                    return {}
+            except Exception:
+                raise PacktConnectionError(error_message)
         # download ebook
-        self.__get_my_all_books_data()
-        if formats is None:
-            formats = self.cfg.download_formats
-            if formats is None:
-                formats = self.download_formats
-        if titles is not None:
-            temp_book_data = [data for data in self.book_data
-                              if any(ConfigurationModel.convert_book_title_to_valid_string(data['title']) ==
-                                     ConfigurationModel.convert_book_title_to_valid_string(title) for title in
-                                     titles)]
-        else:  # download all
-            temp_book_data = self.book_data
-        if len(temp_book_data) == 0:
-            logger.info("There is no books with provided titles: {} at your account!".format(titles))
+        my_books_data = [product_data] if product_data else self.get_all_books_data(api_client)
+        formats = formats or self.cfg.download_formats or self.download_formats
+
         nr_of_books_downloaded = 0
         is_interactive = sys.stdout.isatty()
-        for i, book in enumerate(temp_book_data):
-            for form in formats:
-                if form in list(temp_book_data[i]['download_urls'].keys()):
-                    if form == 'code':
-                        file_type = 'zip'
-                    else:
-                        file_type = form
-                    title = ConfigurationModel.convert_book_title_to_valid_string(
-                        temp_book_data[i]['title'])  # format valid pathname
-                    logger.info("Title: '{}'".format(title))
+        for book in my_books_data:
+            download_urls = get_product_download_urls(book['id'])
+            for format, download_url in download_urls.items():
+                if format in formats:
+                    file_extention = 'zip' if format in ('video', 'code') else format
+                    file_name = slugify_book_title(book['title'])
+                    logger.info('Title: "{}"'.format(book['title']))
                     if into_folder:
-                        target_download_path = os.path.join(self.cfg.download_folder_path, title)
+                        target_download_path = os.path.join(self.cfg.download_folder_path, file_name)
                         if not os.path.isdir(target_download_path):
                             os.mkdir(target_download_path)
                     else:
                         target_download_path = os.path.join(self.cfg.download_folder_path)
-                    full_file_path = os.path.join(target_download_path,
-                                                  "{}.{}".format(title, file_type))
+                    full_file_path = os.path.join(target_download_path, '{}.{}'.format(file_name, file_extention))
                     if os.path.isfile(full_file_path):
-                        logger.info("'{}.{}' already exists under the given path".format(title, file_type))
+                        logger.info('"{}.{}" already exists under the given path.'.format(file_name, file_extention))
                     else:
-                        if form == 'code':
-                            logger.info("Downloading code for eBook: '{}'...".format(title))
+                        if format == 'code':
+                            logger.info('Downloading code for ebook: "{}"...'.format(book['title']))
+                        elif format == 'video':
+                            logger.info('Downloading "{}" video...'.format(book['title']))
                         else:
-                            logger.info("Downloading eBook: '{}' in .{} format...".format(title, form))
+                            logger.info('Downloading ebook: "{}" in {} format...'.format(book['title'], format))
                         try:
-                            r = self.session.get(
-                                self.cfg.packtpub_url + temp_book_data[i]['download_urls'][form],
-                                timeout=100,
-                                stream=True
-                            )
+                            file_url = api_client.get(download_url).json().get('data')
+                            r = api_client.get(file_url, timeout=100, stream=True)
                             if r.status_code is 200:
                                 with open(full_file_path, 'wb') as f:
                                     total_length = int(r.headers.get('content-length'))
@@ -301,18 +223,21 @@ class PacktPublishingFreeEbook(object):
                                             f.flush()
                                     if is_interactive:
                                         PacktPublishingFreeEbook.update_download_progress_bar(-1)  # add end of line
-                                if form == 'code':
-                                    logger.success("Code for eBook: '{}' downloaded successfully!".format(title))
+                                if format == 'code':
+                                    logger.success('Code for ebook "{}" downloaded successfully!'.format(book['title']))
                                 else:
-                                    logger.success("eBook: '{}.{}' downloaded successfully!".format(title, form))
+                                    logger.success('Ebook "{}" in {} format downloaded successfully!'.format(
+                                        book['title'],
+                                        format
+                                    ))
                                 nr_of_books_downloaded += 1
                             else:
-                                message = "Cannot download '{}'".format(title)
+                                message = 'Couldn\'t download "{}" ebook in {} format.'.format(book['title'], format)
                                 logger.error(message)
                                 raise requests.exceptions.RequestException(message)
                         except Exception as e:
                             logger.error(e)
-        logger.info("{} eBooks have been downloaded!".format(str(nr_of_books_downloaded)))
+        logger.info("{} ebooks have been downloaded!".format(str(nr_of_books_downloaded)))
 
     @staticmethod
     def update_download_progress_bar(current_work_done):
@@ -325,84 +250,72 @@ class PacktPublishingFreeEbook(object):
             print("")
 
 
-# Main
-if __name__ == '__main__':
-
-    parser = argparse.ArgumentParser()
-    parser.add_argument("-g", "--grab", help="grabs daily ebook",
-                        action="store_true")
-    parser.add_argument("-gl", "--grabl", help="grabs and log ebook extra info data",
-                        action="store_true")
-    parser.add_argument("-gd", "--grabd", help="grabs daily ebook and downloads the title afterwards",
-                        action="store_true")
-    parser.add_argument("-da", "--dall", help="downloads all ebooks from your account",
-                        action="store_true")
-    parser.add_argument("-dc", "--dchosen", help="downloads chosen titles described in [download_book_titles] field",
-                        action="store_true")
-    parser.add_argument("-sgd", "--sgd", help="sends the grabbed eBook to google drive",
-                        action="store_true")
-    parser.add_argument("-m", "--mail", help="send download to emails defined in config file", default=False,
-                        action="store_true")
-    parser.add_argument("-sm", "--status_mail", help="send fail report email when script somehow failed", default=False,
-                        action="store_true")
-    parser.add_argument("-f", "--folder", help="downloads eBook into a folder", default=False,
-                        action="store_true")
-    parser.add_argument("-c", "--cfgpath", help="select folder where config file can be found",
-                        default=os.path.join(os.getcwd(), "configFile.cfg"))
-    parser.add_argument("--noauth_local_webserver", help="set if you want auth google_drive without local browser",
-                        action="store_true")
-
-    args = parser.parse_args()
-    cfg_file_path = args.cfgpath
-    into_folder = args.folder
+@click.command()
+@click.option('-c', '--cfgpath', default=os.path.join(os.getcwd(), 'configFile.cfg'), help='Config file path.')
+@click.option('-g', '--grab', is_flag=True, help='Grab Free Learning Packt ebook.')
+@click.option('-gd', '--grabd', is_flag=True, help='Grab Free Learning Packt ebook and download it afterwards.')
+@click.option('-da', '--dall', is_flag=True, help='Download all ebooks from your Packt account.')
+@click.option('-sgd', '--sgd', is_flag=True, help='Grab Free Learning Packt ebook and download it to Google Drive.')
+@click.option('-m', '--mail', is_flag=True, help='Grab Free Learning Packt ebook and send it by an email.')
+@click.option('-sm', '--status_mail', is_flag=True, help='Send an email whether script execution was successful.')
+@click.option('-f', '--folder', default=False, help='Download ebooks into separate directories.')
+@click.option(
+    '--noauth_local_webserver',
+    is_flag=True,
+    default=False,
+    help='See Google Drive API Setup section in README.'
+)
+def packt_cli(cfgpath, grab, grabd, dall, sgd, mail, status_mail, folder, noauth_local_webserver):
+    config_file_path = cfgpath
+    into_folder = folder
 
     try:
-        cfg = ConfigurationModel(cfg_file_path)
+        cfg = ConfigurationModel(config_file_path)
         ebook = PacktPublishingFreeEbook(cfg)
+        api_client = PacktAPIClient(cfg.my_packt_email, cfg.my_packt_password)
 
         # Grab the newest book
-        if args.grab or args.grabl or args.grabd or args.sgd or args.mail:
-            ebook.grab_ebook(log_ebook_infodata=args.grabl)
+        if grab or grabd or sgd or mail:
+            ebook.grab_ebook(api_client)
 
             # Send email about successful book grab. Do it only when book
             # isn't going to be emailed as we don't want to send email twice.
-            if args.status_mail and not args.mail:
+            if status_mail and not mail:
                 from utils.mail import MailBook
-                mb = MailBook(cfg_file_path)
+                mb = MailBook(config_file_path)
                 mb.send_info(
                     subject=SUCCESS_EMAIL_SUBJECT.format(
                         dt.datetime.now().strftime(DATE_FORMAT),
-                        ebook.book_title
+                        ebook.book_data['title']
                     ),
-                    body=SUCCESS_EMAIL_BODY.format(ebook.book_title)
+                    body=SUCCESS_EMAIL_BODY.format(ebook.book_data['title'])
                 )
 
-        # Download book(s) into proper location
-        if args.grabd or args.dall or args.dchosen or args.sgd or args.mail:
-            if args.dall:
-                ebook.download_books(into_folder=into_folder)
-            elif args.dchosen:
-                ebook.download_books(cfg.download_book_titles, into_folder=into_folder)
-            elif args.grabd:
-                ebook.download_books([ebook.book_title], into_folder=into_folder)
-            else:
+        # Download book(s) into proper location.
+        if grabd or dall or sgd or mail:
+            if dall:
+                ebook.download_books(api_client, into_folder=into_folder)
+            elif grabd:
+                ebook.download_books(api_client, ebook.book_data, into_folder=into_folder)
+            else:  # sgd or mail
+                # download it temporarily to cwd
                 cfg.download_folder_path = os.getcwd()
-                ebook.download_books([ebook.book_title], into_folder=into_folder)
+                ebook.download_books(api_client, ebook.book_data, into_folder=False)
 
-        # Send downloaded book(s) by mail or to google_drive
-        if args.sgd or args.mail:
+        # Send downloaded book(s) by mail or to Google Drive.
+        if sgd or mail:
             paths = [
                 os.path.join(cfg.download_folder_path, path)
                 for path in os.listdir(cfg.download_folder_path)
-                if os.path.isfile(path) and ebook.book_title in path
+                if os.path.isfile(path) and slugify_book_title(ebook.book_data['title']) in path
             ]
-            if args.sgd:
+            if sgd:
                 from utils.google_drive import GoogleDriveManager
-                google_drive = GoogleDriveManager(cfg_file_path)
+                google_drive = GoogleDriveManager(config_file_path)
                 google_drive.send_files(paths)
             else:
                 from utils.mail import MailBook
-                mb = MailBook(cfg_file_path)
+                mb = MailBook(config_file_path)
                 pdf_path = None
                 mobi_path = None
                 try:
@@ -420,9 +333,9 @@ if __name__ == '__main__':
         logger.success("Good, looks like all went well! :-)")
     except Exception as e:
         logger.error("Exception occurred {}".format(e))
-        if args.status_mail:
+        if status_mail:
             from utils.mail import MailBook
-            mb = MailBook(cfg_file_path)
+            mb = MailBook(config_file_path)
             mb.send_info(
                 subject=FAILURE_EMAIL_SUBJECT.format(dt.datetime.now().strftime(DATE_FORMAT)),
                 body=FAILURE_EMAIL_BODY.format(str(e))
