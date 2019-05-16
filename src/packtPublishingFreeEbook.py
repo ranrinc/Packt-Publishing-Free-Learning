@@ -145,14 +145,18 @@ class PacktPublishingFreeEbook(object):
         [user_data] = user_response.json().get('data')
         user_id = user_data.get('id')
 
+        product_response = api_client.get(PACKT_PRODUCT_SUMMARY_URL.format(product_id=product_id))
+        self.book_data = {'id': product_id, 'title': product_response.json()['title']}\
+            if product_response.status_code == 200 else None
+
+        if any(product_id == book['id'] for book in self.get_all_books_data(api_client)):
+            logger.info('You have already claimed Packt Free Learning "{}" offer.'.format(self.book_data['title']))
+            return
+
         claim_response = api_client.put(
             PACKT_API_FREE_LEARNING_CLAIM_URL.format(user_id=user_id, offer_id=offer_id),
             json={'recaptcha': self.solve_packt_recapcha()}
         )
-
-        product_response = api_client.get(PACKT_PRODUCT_SUMMARY_URL.format(product_id=product_id))
-        self.book_data = {'id': product_id, 'title': product_response.json()['title']}\
-            if product_response.status_code == 200 else None
 
         if claim_response.status_code == 200:
             logger.info('A new Packt Free Learning ebook "{}" has been grabbed!'.format(self.book_data['title']))
@@ -186,7 +190,7 @@ class PacktPublishingFreeEbook(object):
         for book in my_books_data:
             download_urls = get_product_download_urls(book['id'])
             for format, download_url in download_urls.items():
-                if format in formats:
+                if format in formats and not (format == 'code' and 'video' in download_urls and 'video' in formats):
                     file_extention = 'zip' if format in ('video', 'code') else format
                     file_name = slugify_book_title(book['title'])
                     logger.info('Title: "{}"'.format(book['title']))
@@ -197,6 +201,7 @@ class PacktPublishingFreeEbook(object):
                     else:
                         target_download_path = os.path.join(self.cfg.download_folder_path)
                     full_file_path = os.path.join(target_download_path, '{}.{}'.format(file_name, file_extention))
+                    temp_file_path = os.path.join(target_download_path, 'download.tmp')
                     if os.path.isfile(full_file_path):
                         logger.info('"{}.{}" already exists under the given path.'.format(file_name, file_extention))
                     else:
@@ -210,19 +215,25 @@ class PacktPublishingFreeEbook(object):
                             file_url = api_client.get(download_url).json().get('data')
                             r = api_client.get(file_url, timeout=100, stream=True)
                             if r.status_code is 200:
-                                with open(full_file_path, 'wb') as f:
-                                    total_length = int(r.headers.get('content-length'))
-                                    num_of_chunks = (total_length / 1024) + 1
-                                    for num, chunk in enumerate(r.iter_content(chunk_size=1024)):
-                                        if chunk:
-                                            if is_interactive:
-                                                PacktPublishingFreeEbook.update_download_progress_bar(
-                                                    num / num_of_chunks
-                                                )
-                                            f.write(chunk)
-                                            f.flush()
-                                    if is_interactive:
-                                        PacktPublishingFreeEbook.update_download_progress_bar(-1)  # add end of line
+                                try:
+                                    with open(temp_file_path, 'wb') as f:
+                                        total_length = int(r.headers.get('content-length'))
+                                        num_of_chunks = (total_length / 1024) + 1
+                                        for num, chunk in enumerate(r.iter_content(chunk_size=1024)):
+                                            if chunk:
+                                                if is_interactive:
+                                                    PacktPublishingFreeEbook.update_download_progress_bar(
+                                                        num / num_of_chunks
+                                                    )
+                                                f.write(chunk)
+                                                f.flush()
+                                        if is_interactive:
+                                            PacktPublishingFreeEbook.update_download_progress_bar(-1)  # add end of line
+                                    os.rename(temp_file_path, full_file_path)
+                                finally:
+                                    if os.path.isfile(temp_file_path):
+                                        os.remove(temp_file_path)
+
                                 if format == 'code':
                                     logger.success('Code for ebook "{}" downloaded successfully!'.format(book['title']))
                                 else:
@@ -258,7 +269,7 @@ class PacktPublishingFreeEbook(object):
 @click.option('-sgd', '--sgd', is_flag=True, help='Grab Free Learning Packt ebook and download it to Google Drive.')
 @click.option('-m', '--mail', is_flag=True, help='Grab Free Learning Packt ebook and send it by an email.')
 @click.option('-sm', '--status_mail', is_flag=True, help='Send an email whether script execution was successful.')
-@click.option('-f', '--folder', default=False, help='Download ebooks into separate directories.')
+@click.option('-f', '--folder', is_flag=True, default=False, help='Download ebooks into separate directories.')
 @click.option(
     '--noauth_local_webserver',
     is_flag=True,
